@@ -14,8 +14,34 @@ const rng=(a)=>Math.floor(Math.random()*a);
 const shuffled=a=>{const b=[...a]; for(let i=b.length-1;i>0;i--){let j=rng(i+1); [b[i],b[j]]=[b[j],b[i]];}return b;};
 const total=o=>ALL.reduce((a,c)=>a+num(o[c]),0);
 const emptyGems=()=>Object.fromEntries(ALL.map(c=>[c,0]));
-const baseBank=180000, basicTurn=20000;
+const baseBank=300000, basicTurn=30000;
 let expandedPlayerId='', network=null, roomCode='', state=null, seenUpdate='', activeUser='', clientName=localStorage.getItem('gem_name')||'', activeMode='', presence={}, serverOffset=0, isBusy=false, selected=[], takeMode='diff', modal=null, view='game', toastTimer=null, uiTimer=null;
+
+/* 自分の手番が始まったときだけ表示するカットイン演出。タイマーは止めない。 */
+let lastTurnCutInKey = '';
+let turnCutInTimer = null;
+function clearTurnCutIn(){
+  if(turnCutInTimer !== null){clearTimeout(turnCutInTimer);turnCutInTimer=null;}
+  document.getElementById('turnCutIn')?.remove();
+}
+function showTurnCutIn(actor){
+  clearTurnCutIn();
+  const overlay=document.createElement('div');
+  overlay.id='turnCutIn';
+  overlay.className='turn-cutin';
+  overlay.setAttribute('aria-hidden','true');
+  overlay.innerHTML=`<div class="turn-cutin-band"><div class="turn-cutin-copy"><span class="turn-cutin-kicker">YOUR TURN!</span><strong class="turn-cutin-main">あなたの番です！</strong><span class="turn-cutin-name"></span></div></div>`;
+  overlay.querySelector('.turn-cutin-name').textContent=playerName(actor)+' のターン';
+  document.body.appendChild(overlay);
+  turnCutInTimer=setTimeout(()=>{overlay.remove();turnCutInTimer=null;},1700);
+}
+function announceOwnTurn(g,id,actor){
+  if(!g || g.phase!=='turn' || id!==actor) return;
+  const key=[activeMode,roomCode||'local',g.turnStart,actor].join(':');
+  if(lastTurnCutInKey===key)return;
+  lastTurnCutInKey=key;
+  showTurnCutIn(actor);
+}
 
 function now(){return Date.now()+serverOffset;}
 function showToast(msg){const el=$('toast');el.textContent=msg;el.classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('visible'),3600);}
@@ -25,7 +51,7 @@ function cfgReady(){const v=cfg();return Boolean(v.apiKey&&v.databaseURL&&v.proj
 function asArray(x){if(Array.isArray(x))return x;if(x&&typeof x==='object')return Object.keys(x).sort((a,b)=>Number(a)-Number(b)).map(k=>x[k]);return [];}
 function normalizeState(s){if(!s)return s;
  s.history=asArray(s.history);s.players=asArray(s.players);
- if(s.game){const g=s.game;g.turnOrder=asArray(g.turnOrder);g.nobles=asArray(g.nobles);g.nobleCandidates=asArray(g.nobleCandidates);
+ if(s.game){const g=s.game;g.actionLog=asArray(g.actionLog);g.turnOrder=asArray(g.turnOrder);g.nobles=asArray(g.nobles);g.nobleCandidates=asArray(g.nobleCandidates);
   g.deck=g.deck||{};g.market=g.market||{};
   for(const tier of [1,2,3]){g.deck[tier]=asArray(g.deck[tier]);const slots=g.market[tier]||{};g.market[tier]=Array.from({length:4},(_,i)=>Number(slots[i])||0);}
   for(const p of Object.values(g.p||{})){p.cards=asArray(p.cards);p.reserve=asArray(p.reserve);p.nobles=asArray(p.nobles);}
@@ -41,7 +67,23 @@ function newGame(players,t){
  }
  const p={};for(const pl of players)p[pl.id]={chips:emptyGems(),cards:[],reserve:[],nobles:[],bank:baseBank};
  const supply=emptyGems();COLORS.forEach(c=>supply[c]=players.length===2?4:players.length===3?5:7);supply.gold=5;
- return {turnOrder:shuffled(players.map(p=>p.id)),p,supply,market,deck,nobles:shuffled(GAME_DATA.nobles.map(n=>n.id)).slice(0,players.length+1),phase:'turn',turnIndex:0,turnStart:t,nobleStart:0,nobleCandidates:[],completed:0,ending:false,log:'ゲーム開始',seq:0};
+ return {turnOrder:shuffled(players.map(p=>p.id)),p,supply,market,deck,nobles:shuffled(GAME_DATA.nobles.map(n=>n.id)).slice(0,players.length+1),phase:'turn',turnIndex:0,turnStart:t,nobleStart:0,nobleCandidates:[],completed:0,ending:false,log:'ゲーム開始',actionLog:[],seq:0};
+}
+// 行動履歴はFirebaseのゲーム状態に含めるため、全員へ同じ順序で同期される。
+// 名前は確定した時点のもの、ターン番号は各プレイヤーの手番回数を記録。
+function appendActionLog(s,id,t,kind,detail){
+ const g=s.game;if(!g)return;
+ if(!Array.isArray(g.actionLog))g.actionLog=asArray(g.actionLog);
+ const pl=s.players.find(p=>p.id===id);
+ const turn=Math.floor(g.completed/g.turnOrder.length)+1;
+ g.actionLog.push({playerId:id,name:pl?.name||'プレイヤー',turn,kind,detail,at:t});
+ // データが増えすぎないよう、対戦につき直近500件を保存する。
+ if(g.actionLog.length>500)g.actionLog=g.actionLog.slice(-500);
+}
+function colorNames(list){return list.map(c=>CNAME[c]||c).join('・');}
+function returnedText(returned){
+ const items=[];for(const c of ALL)for(let i=0;i<num(returned?.[c]);i++)items.push(CNAME[c]);
+ return items.length?'（返却：'+items.join('・')+'）':'';
 }
 function activeId(g){return g.turnOrder[g.turnIndex];}
 function owner(){if(activeMode==='local')return state?.game?activeId(state.game):'local-1';return activeUser;}
@@ -75,14 +117,14 @@ function finishTurn(s,t){
  if(g.ending && g.completed%g.turnOrder.length===0){g.phase='results';s.status='results';
   const results=g.turnOrder.map(id=>({id,name:s.players.find(p=>p.id===id)?.name||'参加者',points:vp(g,id),cards:g.p[id].cards.length,nobles:g.p[id].nobles.length,bank:g.p[id].bank})).sort((a,b)=>b.points-a.points||a.cards-b.cards);
   results.forEach((v,i)=>v.rank=i>0&&v.points===results[i-1].points&&v.cards===results[i-1].cards?results[i-1].rank:i+1);
-  s.history=s.history||[];s.history.push({at:t,results});
+  s.history=s.history||[];s.history.push({at:t,results,actions:dup(g.actionLog||[])});
   for(const pl of s.players){pl.ready=false;pl.view='results';}
  }else{g.turnIndex=(g.turnIndex+1)%g.turnOrder.length;g.turnStart=t;g.phase='turn';}
  g.seq++;
 }
 function postMove(s,t){
  const g=s.game,id=activeId(g),valid=candidates(g,id);
- if(valid.length===1){g.p[id].nobles.push(valid[0]);g.nobles=g.nobles.filter(n=>n!==valid[0]);g.log=playerName(id)+'が貴族を獲得';finishTurn(s,t);}
+ if(valid.length===1){g.p[id].nobles.push(valid[0]);g.nobles=g.nobles.filter(n=>n!==valid[0]);g.log=playerName(id)+'が貴族を獲得';appendActionLog(s,id,t,'noble','貴族獲得　3点');finishTurn(s,t);}
  else if(valid.length>1){g.phase='noble';g.nobleCandidates=valid;g.nobleStart=t;g.seq++;}
  else finishTurn(s,t);
 }
@@ -134,7 +176,7 @@ function apply(s,uid,a,t){
    if(g.phase==='noble'){
      if(t<g.nobleStart+10000)return null;
      const chosen=g.nobleCandidates[rng(g.nobleCandidates.length)];if(!chosen)return null;
-     g.p[id].nobles.push(chosen);g.nobles=g.nobles.filter(x=>x!==chosen);g.log='貴族の選択時間切れ';finishTurn(s,t);return s;
+     g.p[id].nobles.push(chosen);g.nobles=g.nobles.filter(x=>x!==chosen);g.log='貴族の選択時間切れ';appendActionLog(s,id,t,'noble','貴族獲得　3点（選択時間切れ・自動）');finishTurn(s,t);return s;
    }
    if(g.phase!=='turn'||!expired(g,t))return null;
    const auto=randomAuto(g,id);g.p[id].bank=0;
@@ -142,13 +184,15 @@ function apply(s,uid,a,t){
      const add=emptyGems();for(const c of auto.kind==='take2'?[auto.color,auto.color]:auto.colors)add[c]++;
      if(!addGems(g,id,add,auto.returned))return null;
    }
+   const picked=auto.kind==='take2'?[auto.color,auto.color]:auto.kind==='take'?auto.colors:[];
+   appendActionLog(s,id,t,'timeout',picked.length?'時間切れ・宝石自動獲得　'+colorNames(picked)+returnedText(auto.returned):'時間切れ・取得可能な宝石なし（自動パス）');
    g.log=playerName(id)+'が時間切れ：自動で宝石取得';postMove(s,t);return s;
  }
  if(id!==uid)return null;
  if(a.expected!==g.seq)return null;
  if(g.phase==='noble'){
    if(a.kind!=='noble'||!g.nobleCandidates.includes(a.id)||t>=g.nobleStart+10000)return null;
-   g.p[id].nobles.push(a.id);g.nobles=g.nobles.filter(x=>x!==a.id);g.log=playerName(id)+'が貴族を選択';finishTurn(s,t);return s;
+   g.p[id].nobles.push(a.id);g.nobles=g.nobles.filter(x=>x!==a.id);g.log=playerName(id)+'が貴族を選択';appendActionLog(s,id,t,'noble','貴族獲得　3点');finishTurn(s,t);return s;
  }
  if(g.phase!=='turn'||expired(g,t))return null;
  const bankUsed=Math.max(0,t-g.turnStart-basicTurn), pp=g.p[id];
@@ -156,6 +200,7 @@ function apply(s,uid,a,t){
    if(!isAllowedTake(g,a))return null;
    const added=emptyGems();for(const c of a.kind==='take2'?[a.color,a.color]:a.colors)added[c]++;
    if(!addGems(g,id,added,a.returned||{}))return null;
+   appendActionLog(s,id,t,'take','宝石獲得　'+colorNames(a.kind==='take2'?[a.color,a.color]:a.colors)+returnedText(a.returned));
    g.log=playerName(id)+'が宝石を取得';
  }else if(a.kind==='reserve'){
    if(pp.reserve.length>=3)return null;
@@ -167,6 +212,7 @@ function apply(s,uid,a,t){
    }else return null;
    pp.reserve.push(cardId);
    if(!addGems(g,id,reserveTake(g),a.returned||{}))return null;
+   appendActionLog(s,id,t,'reserve','発展カード予約　'+(a.source==='deck'?'山札':'公開カード')+' Lv.'+CARDMAP[cardId].level+'（内容非公開）'+returnedText(a.returned));
    g.log=playerName(id)+'がカードを予約';
  }else if(a.kind==='buy'){
    let cardId=0;
@@ -177,6 +223,7 @@ function apply(s,uid,a,t){
    for(const c of ALL){pp.chips[c]-=pay.payment[c];g.supply[c]+=pay.payment[c];}
    pp.cards.push(cardId);
    if(a.source==='market')getRefill(g,a.tier,a.slot);else pp.reserve.splice(a.slot,1);
+   appendActionLog(s,id,t,'buy','発展カード購入　'+CNAME[card.color]+' Lv.'+card.level+' '+card.points+'点');
    g.log=playerName(id)+'がLv.'+card.level+'カードを購入';
  }else return null;
  pp.bank=Math.max(0,pp.bank-bankUsed);
@@ -197,19 +244,33 @@ function discountsHTML(g,id){const b=bonuses(g,id);return `<div class="discounts
 function bankUI(g,id){const val=id===activeId(g)&&g.phase==='turn'?currentBank(g,now()):g.p[id].bank;return timeText(val);}
 function panelHTML(g,id,detail){const me=id===owner(),pp=g.p[id],name=escapeHtml(playerName(id)),isPlaying=id===activeId(g),pts=vp(g,id);
 return `<section class="player ${isPlaying?'playing':''}"><div class="player-head"><div><strong>${name}${me?'（自分）':''}</strong>${isPlaying?'<span class="playing-mark">手番中</span>':''}</div><div class="score">${pts}<small> / 15点</small></div></div><div class="player-meta"><span>購入 ${pp.cards.length}枚</span><span>貴族 ${pp.nobles.length}枚</span><span>予約 ${pp.reserve.length}/3</span><span class="bank-el" data-bank-id="${escapeHtml(id)}">持ち時間 ${bankUI(g,id)}</span></div>${!detail||(!me&&g.turnOrder.length>2)?`<button class="smallbtn" data-expand-player="${escapeHtml(id)}">${detail?'詳細を閉じる':'詳細を見る'}</button>`:''}${detail?`<div class="player-detail"><div class="tiny-title">所持宝石</div>${chipsHTML(pp.chips)}<div class="tiny-title">購入割引</div>${discountsHTML(g,id)}<div class="tiny-title">購入済みカード ${pp.cards.length}枚</div><div class="owned">${COLORS.map(c=>`<span class="owned-color ${c}">${CNAME[c]} ${pp.cards.filter(cid=>CARDMAP[cid].color===c).length}</span>`).join('')}</div><div class="tiny-title">貴族</div><div class="mini-nobles">${pp.nobles.length?pp.nobles.map(nid=>nobleHtml(nid,false)).join(''):'まだ獲得していません'}</div>${me?`<div class="tiny-title">予約カード（本人のみ）</div><div class="reserved-row">${pp.reserve.map((cid,slot)=>cardHtml(cid,'reserved',CARDMAP[cid].level,slot,id)).join('')}${pp.reserve.length===0?'<span class="muted">予約なし</span>':''}</div>`:''}</div>`:''}</section>`;}
-function renderMenu(){view='menu';$('app').innerHTML=`<div class="menu-layout"><div class="hero"><span class="hero-emblem">✦</span><h1>GEM COURT</h1><p>宝石と発展カードの戦略ボードゲーム</p><p class="smallnote">原作ベース・2〜4人／20秒＋持ち時間180秒</p></div><div class="menu-panel"><label>プレイヤー名<input id="nameInput" maxlength="18" placeholder="プレイヤー名" value="${escapeHtml(clientName)}"></label><div class="menu-buttons"><button class="primary" data-act="local">この端末でテスト対戦</button><button data-act="online">オンライン対戦</button></div><p class="footnote">テスト対戦は1台で交代して遊べます。オンライン対戦は共通のFirebaseに自動接続します。</p></div></div>`;}
-function renderOnlineStart(){view='onlineStart';$('app').innerHTML=`<div class="wrap online-start"><h2>オンライン対戦</h2><p class="muted">ルームを作るか、6文字のコードで参加してください。</p><div class="two-cols"><section class="pane"><h3>ルームを作成</h3><button class="primary" data-act="createRoom">新しいルームを作成</button></section><section class="pane"><h3>ルームに参加</h3><input id="joinCode" maxlength="6" placeholder="例：A7K2XM" autocapitalize="characters"><button data-act="joinRoom">参加する</button></section></div><button class="ghost" data-act="menu">タイトルへ戻る</button></div>`;}
-function renderLobby(){view='lobby';const host=state.host===owner();const p=state.players.find(p=>p.id===owner()),allReady=state.players.length>=2&&state.players.every(p=>p.ready);
+function logRowsHTML(logs){
+ if(!logs?.length)return '<p class="action-history-empty">まだ行動履歴がありません</p>';
+ return logs.map(e=>`<div class="action-entry action-${escapeHtml(e.kind||'other')}"><div class="action-entry-top"><strong>${escapeHtml(e.name||'プレイヤー')}のターン${num(e.turn)||1}</strong><small>${e.at?new Date(e.at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'}):''}</small></div><div class="action-entry-detail">${escapeHtml(e.detail||'')}</div></div>`).join('');
+}
+function recentActionsHTML(g){
+ const logs=asArray(g.actionLog);
+ return `<section class="action-history"><div class="action-history-head"><strong>行動履歴</strong><button class="smallbtn" data-act="openHistory">全件を見る（${logs.length}件）</button></div><div class="action-history-list">${logRowsHTML(logs.slice(-5).reverse())}</div></section>`;
+}
+function openHistoryModal(){
+ const logs=state?.status==='playing'?asArray(state.game?.actionLog):asArray((state?.history||[]).slice(-1)[0]?.actions);
+ const sorted=logs.slice().reverse();
+ showModal(`<div class="dialog-head"><h3>行動履歴（${sorted.length}件）</h3><button class="iconbtn" data-act="closeModal" aria-label="閉じる">×</button></div><p class="muted">新しい行動から表示しています。発展カードの予約内容は公開しません。</p><div class="action-history-full">${logRowsHTML(sorted)}</div><div class="row actions"><button data-act="closeModal">閉じる</button></div>`);
+}
+function renderMenu(){clearTurnCutIn();view='menu';$('app').innerHTML=`<div class="menu-layout"><div class="hero"><span class="hero-emblem">✦</span><h1>GEM COURT</h1><p>宝石と発展カードの戦略ボードゲーム</p><p class="smallnote">原作ベース・2〜4人／30秒＋持ち時間300秒</p></div><div class="menu-panel"><label>プレイヤー名<input id="nameInput" maxlength="18" placeholder="プレイヤー名" value="${escapeHtml(clientName)}"></label><div class="menu-buttons"><button class="primary" data-act="local">この端末でテスト対戦</button><button data-act="online">オンライン対戦</button></div><p class="footnote">テスト対戦は1台で交代して遊べます。オンライン対戦は共通のFirebaseに自動接続します。</p></div></div>`;}
+function renderOnlineStart(){clearTurnCutIn();view='onlineStart';$('app').innerHTML=`<div class="wrap online-start"><h2>オンライン対戦</h2><p class="muted">ルームを作るか、6文字のコードで参加してください。</p><div class="two-cols"><section class="pane"><h3>ルームを作成</h3><button class="primary" data-act="createRoom">新しいルームを作成</button></section><section class="pane"><h3>ルームに参加</h3><input id="joinCode" maxlength="6" placeholder="例：A7K2XM" autocapitalize="characters"><button data-act="joinRoom">参加する</button></section></div><button class="ghost" data-act="menu">タイトルへ戻る</button></div>`;}
+function renderLobby(){clearTurnCutIn();view='lobby';const host=state.host===owner();const p=state.players.find(p=>p.id===owner()),allReady=state.players.length>=2&&state.players.every(p=>p.ready);
  $('app').innerHTML=`<div class="wrap lobby"><div class="toprow"><h2>対戦ルーム</h2><span class="room-code" data-act="copyCode" title="押してコピー">${escapeHtml(roomCode||'ローカル')}</span></div><p class="muted">2〜4人参加・全員準備完了後にホストが開始します</p><div class="pane"><h3>参加者 ${state.players.length} / 4</h3>${state.players.map(pl=>`<div class="lobby-person"><span>${escapeHtml(pl.name)} ${pl.id===state.host?'<b>♛ ホスト</b>':''}</span><span>${pl.ready?'<span class="ok">✓ 準備完了</span>':'準備中'}</span>${host&&pl.id!==owner()?`<button class="smallbtn" data-act="kick" data-target="${escapeHtml(pl.id)}">退出させる</button>`:''}</div>`).join('')}</div><div class="row actions"><button class="primary" data-act="toggleReady">${p?.ready?'準備を取り消す':'準備完了'}</button>${host?`<button ${allReady?'':'disabled'} data-act="start">ゲーム開始</button>`:''}<button class="danger" data-act="leave">${host?'ルームを解散':'退出'}</button></div><p class="smallnote">${activeMode==='local'?'ローカルのテスト対戦は2人で開始します。':'対戦中に切断した場合、同じブラウザから復帰できます。'}</p></div>`;
 }
-function renderResults(){view='results';const last=(state.history||[]).slice(-1)[0];if(!last){renderLobby();return;}
+function renderResults(){clearTurnCutIn();view='results';const last=(state.history||[]).slice(-1)[0];if(!last){renderLobby();return;}
 const finished=state.players.find(p=>p.id===owner())?.view==='lobby';
-$('app').innerHTML=`<div class="wrap results"><div class="hero small"><span class="hero-emblem">♛</span><h1>対戦終了</h1><p>第${(state.history||[]).length}試合</p></div><div class="pane"><table class="results-table"><thead><tr><th>順位</th><th>プレイヤー</th><th>得点</th><th>カード</th><th>貴族</th><th>持ち時間</th></tr></thead><tbody>${last.results.map(r=>`<tr><td>${r.rank}位</td><td>${escapeHtml(r.name)}</td><td><b>${r.points}</b></td><td>${r.cards}</td><td>${r.nobles}</td><td>${timeText(r.bank)}</td></tr>`).join('')}</tbody></table><h3>ルーム内対戦記録</h3><div class="history">${(state.history||[]).map((h,i)=>`<p>第${i+1}試合：${h.results.filter(r=>r.rank===1).map(r=>escapeHtml(r.name)).join('・')}（${h.results.filter(r=>r.rank===1)[0]?.points||0}点）</p>`).join('')}</div></div><div class="row actions">${activeMode==='local'?'<button class="primary" data-act="local">もう一度テスト対戦</button>':''}${finished?'<p class="ok">待機画面に戻る準備ができています。ほかの参加者を待っています。</p>':`<button class="primary" data-act="backLobby">待機画面に戻る</button>`}${state.host===owner()?'<button class="danger" data-act="leave">ルームを解散</button>':''}</div></div>`;
+$('app').innerHTML=`<div class="wrap results"><div class="hero small"><span class="hero-emblem">♛</span><h1>対戦終了</h1><p>第${(state.history||[]).length}試合</p></div><div class="pane"><table class="results-table"><thead><tr><th>順位</th><th>プレイヤー</th><th>得点</th><th>カード</th><th>貴族</th><th>持ち時間</th></tr></thead><tbody>${last.results.map(r=>`<tr><td>${r.rank}位</td><td>${escapeHtml(r.name)}</td><td><b>${r.points}</b></td><td>${r.cards}</td><td>${r.nobles}</td><td>${timeText(r.bank)}</td></tr>`).join('')}</tbody></table><div class="row actions"><button data-act="openHistory">この試合の行動履歴を見る</button></div><h3>ルーム内対戦記録</h3><div class="history">${(state.history||[]).map((h,i)=>`<p>第${i+1}試合：${h.results.filter(r=>r.rank===1).map(r=>escapeHtml(r.name)).join('・')}（${h.results.filter(r=>r.rank===1)[0]?.points||0}点）</p>`).join('')}</div></div><div class="row actions">${activeMode==='local'?'<button class="primary" data-act="local">もう一度テスト対戦</button>':''}${finished?'<p class="ok">待機画面に戻る準備ができています。ほかの参加者を待っています。</p>':`<button class="primary" data-act="backLobby">待機画面に戻る</button>`}${state.host===owner()?'<button class="danger" data-act="leave">ルームを解散</button>':''}</div></div>`;
 }
 function renderGame(){view='game';const g=state.game,id=owner(),actor=activeId(g),myTurn=id===actor&&g.phase==='turn';const me=g.p[id];
  if(!me){$('app').innerHTML='<div class="wrap">自分のプレイヤーデータがありません。</div>';return;}
- $('app').innerHTML=`<div class="game-layout"><header class="game-head"><div><div class="brand">✦ GEM COURT</div><div class="subbrand">${escapeHtml(roomCode||'ローカル対戦')} · ${g.turnOrder.length}人 · 手番${g.completed+1}</div></div><div class="clockbox"><span>${escapeHtml(playerName(actor))}のターン</span><strong id="turnClock">20秒</strong><small id="turnMode">基本時間</small></div><button class="ghost menu-quit" data-act="leave">退出</button></header><main class="game-main"><div class="board"><section class="board-panel nobles-panel"><div class="section-title"><h3>貴族</h3><span>条件を満たすと獲得</span></div><div class="nobles-list">${(g.nobles||[]).map(nid=>nobleHtml(nid,candidates(g,id).includes(nid))).join('')||'<span class="muted">貴族なし</span>'}</div></section>${[3,2,1].map(tier=>`<section class="board-panel"><div class="section-title"><h3>Lv.${tier} 発展カード</h3><button class="deck-button" ${!myTurn||!((g.deck[tier]||[]).length)||me.reserve.length>=3?'disabled':''} data-open-deck="${tier}">山札予約 · 残り${(g.deck[tier]||[]).length}枚</button></div><div class="card-grid">${(g.market[tier]||[]).map((cid,slot)=>cardHtml(cid,'market',tier,slot,id)).join('')}</div></section>`).join('')}<section class="board-panel take-panel"><div class="section-title"><h3>宝石の取得</h3><span>現在の所持数：${total(me.chips)}/10個</span></div><div class="supply">${ALL.map(c=>`<div class="supply-item"><button class="token-pick ${selected.includes(c)?'picked':''}" ${c==='gold'||!myTurn||g.supply[c]===0?'disabled':''} data-select-gem="${c}">${gemIcon(c,num(g.supply[c]))}</button><small>${CNAME[c]}</small></div>`).join('')}</div><div class="take-controls"><div class="tabs"><button class="${takeMode==='diff'?'active':''}" data-take-mode="diff">異なる色（最大3個）</button><button class="${takeMode==='same'?'active':''}" data-take-mode="same">同色2個</button></div><div id="selectionHelp" class="muted">${takeMode==='same'?'同色2個は在庫4個以上必要です':'色を選択してください'}</div><button class="primary" data-act="take" ${myTurn&&selected.length?'':'disabled'}>選んだ宝石を取得する</button></div></section></div><aside class="side-panel"><div class="side-title">プレイヤー情報 <span>持ち時間は全員公開</span></div>${g.turnOrder.map(pid=>panelHTML(g,pid,pid===id||g.turnOrder.length===2||expandedPlayerId===pid)).join('')}<div class="statuslog">${escapeHtml(g.log||'')}</div></aside></main></div>`;
+ $('app').innerHTML=`<div class="game-layout"><header class="game-head"><div><div class="brand">✦ GEM COURT</div><div class="subbrand">${escapeHtml(roomCode||'ローカル対戦')} · ${g.turnOrder.length}人 · 手番${g.completed+1}</div></div><div class="clockbox"><span>${escapeHtml(playerName(actor))}のターン</span><strong id="turnClock">30秒</strong><small id="turnMode">基本時間</small></div><button class="ghost log-head-button" data-act="openHistory">履歴</button><button class="ghost menu-quit" data-act="leave">退出</button></header><main class="game-main"><div class="board"><section class="board-panel nobles-panel"><div class="section-title"><h3>貴族</h3><span>条件を満たすと獲得</span></div><div class="nobles-list">${(g.nobles||[]).map(nid=>nobleHtml(nid,candidates(g,id).includes(nid))).join('')||'<span class="muted">貴族なし</span>'}</div></section>${[3,2,1].map(tier=>`<section class="board-panel"><div class="section-title"><h3>Lv.${tier} 発展カード</h3><button class="deck-button" ${!myTurn||!((g.deck[tier]||[]).length)||me.reserve.length>=3?'disabled':''} data-open-deck="${tier}">山札予約 · 残り${(g.deck[tier]||[]).length}枚</button></div><div class="card-grid">${(g.market[tier]||[]).map((cid,slot)=>cardHtml(cid,'market',tier,slot,id)).join('')}</div></section>`).join('')}<section class="board-panel take-panel"><div class="section-title"><h3>宝石の取得</h3><span>現在の所持数：${total(me.chips)}/10個</span></div><div class="supply">${ALL.map(c=>`<div class="supply-item"><button class="token-pick ${selected.includes(c)?'picked':''}" ${c==='gold'||!myTurn||g.supply[c]===0?'disabled':''} data-select-gem="${c}">${gemIcon(c,num(g.supply[c]))}</button><small>${CNAME[c]}</small></div>`).join('')}</div><div class="take-controls"><div class="tabs"><button class="${takeMode==='diff'?'active':''}" data-take-mode="diff">異なる色（最大3個）</button><button class="${takeMode==='same'?'active':''}" data-take-mode="same">同色2個</button></div><div id="selectionHelp" class="muted">${takeMode==='same'?'同色2個は在庫4個以上必要です':'色を選択してください'}</div><button class="primary" data-act="take" ${myTurn&&selected.length?'':'disabled'}>選んだ宝石を取得する</button></div></section></div><aside class="side-panel"><div class="side-title">プレイヤー情報 <span>持ち時間は全員公開</span></div>${g.turnOrder.map(pid=>panelHTML(g,pid,pid===id||g.turnOrder.length===2||expandedPlayerId===pid)).join('')}${recentActionsHTML(g)}</aside></main></div>`;
  updateTimers();
+ announceOwnTurn(g,id,actor);
  if(g.phase==='noble'&&id===actor)openNobleModal();
 }
 function render(){if(!state){renderMenu();return;}if(state.status==='lobby')renderLobby();else if(state.status==='results')renderResults();else if(state.status==='playing')renderGame();}
@@ -276,7 +337,7 @@ async function saveAction(a){if(isBusy)return;isBusy=true;const t=now(),origSeq=
  }catch(e){fail(e.message);}finally{isBusy=false;}
 }
 function localStart(){activeMode='local';roomCode='';activeUser='local-1';state=makeLobby('local-1',clientName||'プレイヤー1');state.players.push({id:'local-2',name:'プレイヤー2',ready:true,view:'lobby'});state.players[0].ready=true;state=apply(state,'local-1',{kind:'start'},now());render();}
-function resetNetwork(){if(network&&roomCode){network.ref('rooms/'+roomCode+'/state').off();network.ref('rooms/'+roomCode+'/presence').off();if(activeUser)network.ref('rooms/'+roomCode+'/presence/'+activeUser).onDisconnect().cancel().catch(()=>{});}presence={};network=null;roomCode='';state=null;activeMode='';closeModal();}
+function resetNetwork(){clearTurnCutIn();lastTurnCutInKey='';if(network&&roomCode){network.ref('rooms/'+roomCode+'/state').off();network.ref('rooms/'+roomCode+'/presence').off();if(activeUser)network.ref('rooms/'+roomCode+'/presence/'+activeUser).onDisconnect().cancel().catch(()=>{});}presence={};network=null;roomCode='';state=null;activeMode='';closeModal();}
 async function initFirebase(){if(!cfgReady())throw new Error('Firebaseへの接続設定が公開側に登録されていません。管理者にご確認ください');if(typeof firebase==='undefined')throw new Error('Firebase SDKを読み込めませんでした。インターネット接続を確認してください');
  const v=cfg();if(!firebase.apps.length)firebase.initializeApp(v);const auth=firebase.auth();await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);const u=auth.currentUser|| (await auth.signInAnonymously()).user;activeUser=u.uid;network=firebase.database();network.ref('.info/serverTimeOffset').on('value',sn=>{serverOffset=num(sn.val());});}
 function genCode(){const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';return Array.from({length:6},()=>chars[rng(chars.length)]).join('');}
@@ -366,6 +427,7 @@ async function handleClick(e){const el=e.target.closest('button, [data-act]');if
  if(act==='leave'){await leave();return;}
  if(act==='backLobby'){await backLobby();return;}
  if(act==='closeModal'){closeModal();return;}
+ if(act==='openHistory'){openHistoryModal();return;}
  if(act==='take'){checkTake();return;}
  if(act==='resetReturn'){if(modal?.type==='confirm'){modal.returned=emptyGems();renderConfirm();}return;}
  if(act==='commit'){if(modal?.type==='confirm'){const a={...modal.action,returned:modal.returned};await saveAction(a);}return;}
