@@ -298,14 +298,33 @@ async function createRoom(){if(isBusy)return;isBusy=true;try{
  throw new Error('ルームを作れませんでした。もう一度お試しください');
  }catch(e){fail(e.message);}finally{isBusy=false;}}
 async function joinRoom(){if(isBusy)return;isBusy=true;try{
- const code=String($('joinCode')?.value||'').trim().toUpperCase();if(!/^[A-HJ-NP-Z2-9]{6}$/.test(code))throw new Error('6文字のルームコードを入力してください');
- const ref=network.ref('rooms/'+code+'/state'),v=(await ref.once('value')).val();if(!v)throw new Error('ルームが見つかりません');
- if(!v.players?.some(p=>p.id===activeUser)){
-  const result=await ref.transaction(cur=>apply(cur,activeUser,{kind:'join',name:clientName||'ゲスト'},now())||undefined,undefined,false);
-  if(!result.committed)throw new Error('満員か対戦開始済みで参加できません');
+ const code=String($('joinCode')?.value||'').trim().toUpperCase();
+ if(!/^[A-HJ-NP-Z2-9]{6}$/.test(code))throw new Error('6文字のルームコードを入力してください');
+ const ref=network.ref('rooms/'+code+'/state');
+ const existing=normalizeState((await ref.once('value')).val());
+ if(!existing)throw new Error('ルームが見つかりません');
+ if(!existing.players.some(p=>p.id===activeUser)){
+  if(existing.status!=='lobby')throw new Error('このルームは対戦開始済みです');
+  if(existing.players.length>=4)throw new Error('このルームは満員です');
+  // Firebase transactions may first receive null even for a room which exists
+  // on the server. Use the snapshot already read above only for that first pass.
+  let firstPass=true;
+  const action={kind:'join',name:clientName||'ゲスト'};
+  const result=await ref.transaction(cur=>{
+   if(cur===null && firstPass)cur=existing;
+   firstPass=false;
+   return apply(cur,activeUser,action,now())||undefined;
+  },undefined,false);
+  if(!result.committed){
+   const latest=normalizeState((await ref.once('value')).val());
+   if(!latest)throw new Error('ルームが解散されました');
+   if(latest.status!=='lobby')throw new Error('このルームは対戦開始済みです');
+   if(latest.players.length>=4)throw new Error('このルームは満員です');
+   if(!latest.players.some(p=>p.id===activeUser))throw new Error('参加処理を完了できませんでした。再度お試しください');
+  }
  }
  await attachRoom(code);
- }catch(e){fail(e.message);}finally{isBusy=false;}}
+ }catch(e){fail('ルーム参加エラー: '+(e?.message||String(e)));}finally{isBusy=false;}}
 async function leave(){if(!state){resetNetwork();renderMenu();return;}
  if(activeMode==='local'){state=null;activeMode='';renderMenu();return;}
  try{
