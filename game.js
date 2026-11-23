@@ -14,7 +14,7 @@ const rng=(a)=>Math.floor(Math.random()*a);
 const shuffled=a=>{const b=[...a]; for(let i=b.length-1;i>0;i--){let j=rng(i+1); [b[i],b[j]]=[b[j],b[i]];}return b;};
 const total=o=>ALL.reduce((a,c)=>a+num(o[c]),0);
 const emptyGems=()=>Object.fromEntries(ALL.map(c=>[c,0]));
-const baseBank=300000, basicTurn=30000;
+const baseBank=300000, basicTurn=45000;
 let expandedPlayerId='', network=null, roomCode='', state=null, seenUpdate='', activeUser='', clientName=localStorage.getItem('gem_name')||'', activeMode='', presence={}, serverOffset=0, isBusy=false, selected=[], takeMode='diff', modal=null, view='game', toastTimer=null, uiTimer=null;
 
 /* 自分の手番が始まったときだけ表示するカットイン演出。タイマーは止めない。 */
